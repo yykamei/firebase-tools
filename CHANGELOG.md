@@ -1,2 +1,4 @@
 - `ext:install` now supports `--force` and `--non-interactive` flags.
 - Fixes a crash when customers deploy an empty Cloud Functions project (#3705)
+- Uses public v1 AppDistribution API.
+- Adds `appdistribution:testers:add` and `appdistribution:testers:remove` commands (#3072).
