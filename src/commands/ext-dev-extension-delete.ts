@@ -1,15 +1,16 @@
 import * as utils from "../utils";
-import * as clc from "cli-color";
+import * as clc from "colorette";
 
 import { Command } from "../command";
 import { logPrefix } from "../extensions/extensionsHelper";
-import { parseRef, getExtension, deleteExtension } from "../extensions/extensionsApi";
+import { getExtension, deleteExtension } from "../extensions/extensionsApi";
+import * as refs from "../extensions/refs";
 import { promptOnce } from "../prompt";
 import { requireAuth } from "../requireAuth";
 import { FirebaseError } from "../error";
 import { checkMinRequiredVersion } from "../checkMinRequiredVersion";
 
-module.exports = new Command("ext:dev:delete <extensionRef>")
+export const command = new Command("ext:dev:delete <extensionRef>")
   .description("delete an extension")
   .help(
     "use this command to delete an extension, and make it unavailable for developers to install or reconfigure. " +
@@ -18,7 +19,7 @@ module.exports = new Command("ext:dev:delete <extensionRef>")
   .before(requireAuth)
   .before(checkMinRequiredVersion, "extDevMinVersion")
   .action(async (extensionRef: string) => {
-    const { publisherId, extensionId, version } = parseRef(extensionRef);
+    const { publisherId, extensionId, version } = refs.parse(extensionRef);
     if (version) {
       throw new FirebaseError(
         `Deleting a single version is not currently supported. You can only delete ${clc.bold(

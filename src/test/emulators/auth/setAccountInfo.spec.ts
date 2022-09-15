@@ -2,7 +2,7 @@ import { expect } from "chai";
 import { decode as decodeJwt, JwtHeader } from "jsonwebtoken";
 import { FirebaseJwtPayload } from "../../../emulator/auth/operations";
 import { ProviderUserInfo, PROVIDER_PASSWORD, PROVIDER_PHONE } from "../../../emulator/auth/state";
-import { describeAuthEmulator } from "./setup";
+import { describeAuthEmulator, PROJECT_ID } from "./setup";
 import {
   expectStatusCode,
   getAccountInfoByIdToken,
@@ -20,6 +20,7 @@ import {
   TEST_PHONE_NUMBER_2,
   TEST_PHONE_NUMBER_3,
   TEST_INVALID_PHONE_NUMBER,
+  registerTenant,
 } from "./helpers";
 
 describeAuthEmulator("accounts:update", ({ authApi, getClock }) => {
@@ -549,7 +550,7 @@ describeAuthEmulator("accounts:update", ({ authApi, getClock }) => {
     const { localId, idToken } = await registerUser(authApi(), user);
     const savedUserInfo = await getAccountInfoByIdToken(authApi(), idToken);
     expect(savedUserInfo.mfaInfo).to.have.length(2);
-    const oldEnrollmentIds = savedUserInfo.mfaInfo!.map((_) => _.mfaEnrollmentId);
+    const oldEnrollmentIds = savedUserInfo.mfaInfo!.map((info) => info.mfaEnrollmentId);
 
     const newMfaInfo = {
       displayName: "New New",
@@ -916,7 +917,7 @@ describeAuthEmulator("accounts:update", ({ authApi, getClock }) => {
       .then((res) => {
         expectStatusCode(400, res);
         expect(res.body.error.message).to.eq(
-          "Invalid JSON payload received. /mfa/enrollments should be array"
+          "Invalid JSON payload received. /mfa/enrollments must be array"
         );
       });
   });
@@ -1135,5 +1136,49 @@ describeAuthEmulator("accounts:update", ({ authApi, getClock }) => {
         expectStatusCode(400, res);
         expect(res.body.error.message).to.equal("CLAIMS_TOO_LARGE");
       });
+  });
+
+  it("should error if auth is disabled", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, { disableAuth: true });
+
+    await authApi()
+      .post("/identitytoolkit.googleapis.com/v1/accounts:update")
+      .query({ key: "fake-api-key" })
+      .send({ tenantId: tenant.tenantId })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error).to.have.property("message").equals("PROJECT_DISABLED");
+      });
+  });
+
+  it("should set tenantId in oobLink", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, {
+      disableAuth: false,
+      mfaConfig: { state: "ENABLED" as const },
+      allowPasswordSignup: true,
+    });
+    const oldEmail = "alice@example.com";
+    const password = "notasecret";
+    const newEmail = "bob@example.com";
+    const { idToken } = await registerUser(authApi(), {
+      email: oldEmail,
+      password,
+      tenantId: tenant.tenantId,
+    });
+
+    await authApi()
+      .post("/identitytoolkit.googleapis.com/v1/accounts:update")
+      .query({ key: "fake-api-key" })
+      .send({ idToken, email: newEmail, tenantId: tenant.tenantId })
+      .then((res) => {
+        expectStatusCode(200, res);
+      });
+
+    // An oob is sent to the oldEmail
+    const oobs = await inspectOobs(authApi(), tenant.tenantId);
+    expect(oobs).to.have.length(1);
+    expect(oobs[0].email).to.equal(oldEmail);
+    expect(oobs[0].requestType).to.equal("RECOVER_EMAIL");
+    expect(oobs[0].oobLink).to.include(tenant.tenantId);
   });
 });

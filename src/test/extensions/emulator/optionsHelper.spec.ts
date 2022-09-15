@@ -2,7 +2,7 @@ import { expect } from "chai";
 import * as sinon from "sinon";
 
 import * as optionsHelper from "../../../extensions/emulator/optionsHelper";
-import { ExtensionSpec } from "../../../extensions/extensionsApi";
+import { ExtensionSpec, Param, ParamType } from "../../../extensions/types";
 import * as paramHelper from "../../../extensions/paramHelper";
 
 describe("optionsHelper", () => {
@@ -19,7 +19,7 @@ describe("optionsHelper", () => {
       STORAGE_BUCKET: "test.appspot.com",
     };
     let testSpec: ExtensionSpec;
-    let readParamsFileStub: sinon.SinonStub;
+    let readEnvFileStub: sinon.SinonStub;
 
     beforeEach(() => {
       testSpec = {
@@ -29,11 +29,11 @@ describe("optionsHelper", () => {
         sourceUrl: "https://my.stuff.com",
         params: [],
       };
-      readParamsFileStub = sinon.stub(paramHelper, "readParamsFile");
+      readEnvFileStub = sinon.stub(paramHelper, "readEnvFile");
     });
 
     afterEach(() => {
-      readParamsFileStub.restore();
+      readEnvFileStub.restore();
     });
 
     it("should return user and autopopulated params", () => {
@@ -47,12 +47,12 @@ describe("optionsHelper", () => {
           param: "USER_PARAM2",
         },
       ];
-      readParamsFileStub.resolves({
+      readEnvFileStub.returns({
         USER_PARAM1: "val1",
         USER_PARAM2: "val2",
       });
 
-      expect(optionsHelper.getParams(testOptions, testSpec)).to.eventually.deep.eq({
+      expect(optionsHelper.getParams(testOptions, testSpec)).to.deep.eq({
         ...{
           USER_PARAM1: "val1",
           USER_PARAM2: "val2",
@@ -76,13 +76,13 @@ describe("optionsHelper", () => {
           param: "USER_PARAM3",
         },
       ];
-      readParamsFileStub.resolves({
+      readEnvFileStub.returns({
         USER_PARAM1: "${PROJECT_ID}-hello",
         USER_PARAM2: "val2",
         USER_PARAM3: "${USER_PARAM2}",
       });
 
-      expect(optionsHelper.getParams(testOptions, testSpec)).to.eventually.deep.eq({
+      expect(optionsHelper.getParams(testOptions, testSpec)).to.deep.eq({
         ...{
           USER_PARAM1: "test-hello",
           USER_PARAM2: "val2",
@@ -98,22 +98,80 @@ describe("optionsHelper", () => {
           label: "param1",
           param: "USER_PARAM1",
           default: "hi",
+          required: true,
         },
         {
           label: "param2",
           param: "USER_PARAM2",
           default: "hello",
+          required: true,
         },
       ];
-      readParamsFileStub.resolves({});
+      readEnvFileStub.returns({});
 
-      expect(optionsHelper.getParams(testOptions, testSpec)).to.eventually.deep.eq({
+      expect(optionsHelper.getParams(testOptions, testSpec)).to.deep.eq({
         ...{
           USER_PARAM1: "hi",
           USER_PARAM2: "hello",
         },
         ...autoParams,
       });
+    });
+  });
+
+  const TEST_SELECT_PARAM: Param = {
+    param: "SELECT_PARAM",
+    label: "A select param",
+    type: ParamType.SELECT,
+  };
+  const TEST_STRING_PARAM: Param = {
+    param: "STRING_PARAM",
+    label: "A string param",
+    type: ParamType.STRING,
+  };
+  const TEST_MULTISELECT_PARAM: Param = {
+    param: "MULTISELECT_PARAM",
+    label: "A multiselect param",
+    type: ParamType.MULTISELECT,
+  };
+  const TEST_SECRET_PARAM: Param = {
+    param: "SECRET_PARAM",
+    label: "A secret param",
+    type: ParamType.SECRET,
+  };
+  const TEST_PARAMS: Param[] = [
+    TEST_SELECT_PARAM,
+    TEST_STRING_PARAM,
+    TEST_MULTISELECT_PARAM,
+    TEST_SECRET_PARAM,
+  ];
+  const TEST_PARAM_VALUES = {
+    SELECT_PARAM: "select",
+    STRING_PARAM: "string",
+    MULTISELECT_PARAM: "multiselect",
+    SECRET_PARAM: "projects/test/secrets/mysecret/versionms/latest",
+  };
+
+  describe("getNonSecretEnv", () => {
+    it("should return only params that are not secret", () => {
+      expect(optionsHelper.getNonSecretEnv(TEST_PARAMS, TEST_PARAM_VALUES)).to.deep.equal({
+        SELECT_PARAM: "select",
+        STRING_PARAM: "string",
+        MULTISELECT_PARAM: "multiselect",
+      });
+    });
+  });
+
+  describe("getSecretEnv", () => {
+    it("should return only params that are secret", () => {
+      expect(optionsHelper.getSecretEnvVars(TEST_PARAMS, TEST_PARAM_VALUES)).to.have.deep.members([
+        {
+          projectId: "test",
+          key: "SECRET_PARAM",
+          secret: "mysecret",
+          version: "latest",
+        },
+      ]);
     });
   });
 });

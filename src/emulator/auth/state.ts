@@ -4,37 +4,34 @@ import {
   mirrorFieldTo,
   randomDigits,
   isValidPhoneNumber,
+  DeepPartial,
 } from "./utils";
 import { MakeRequired } from "./utils";
 import { AuthCloudFunction } from "./cloudFunctions";
-import { assert } from "./errors";
+import { assert, BadRequestError } from "./errors";
 import { MfaEnrollments, Schemas } from "./types";
 
 export const PROVIDER_PASSWORD = "password";
 export const PROVIDER_PHONE = "phone";
 export const PROVIDER_ANONYMOUS = "anonymous";
 export const PROVIDER_CUSTOM = "custom";
+export const PROVIDER_GAME_CENTER = "gc.apple.com"; // Not yet implemented
 
 export const SIGNIN_METHOD_EMAIL_LINK = "emailLink";
 
-export class ProjectState {
+export abstract class ProjectState {
   private users: Map<string, UserInfo> = new Map();
   private localIdForEmail: Map<string, string> = new Map();
   private localIdForInitialEmail: Map<string, string> = new Map();
   private localIdForPhoneNumber: Map<string, string> = new Map();
   private localIdsForProviderEmail: Map<string, Set<string>> = new Map();
   private userIdForProviderRawId: Map<string, Map<string, string>> = new Map();
-  private refreshTokens: Map<string, RefreshTokenRecord> = new Map();
-  private refreshTokensForLocalId: Map<string, Set<string>> = new Map();
   private oobs: Map<string, OobRecord> = new Map();
   private verificationCodes: Map<string, PhoneVerificationRecord> = new Map();
   private temporaryProofs: Map<string, TemporaryProofRecord> = new Map();
-  public oneAccountPerEmail = true;
-  private authCloudFunction: AuthCloudFunction;
+  private pendingLocalIds: Set<string> = new Set();
 
-  constructor(public readonly projectId: string) {
-    this.authCloudFunction = new AuthCloudFunction(projectId);
-  }
+  constructor(public readonly projectId: string) {}
 
   get projectNumber(): string {
     // TODO: Shall we generate something different for each project?
@@ -42,14 +39,36 @@ export class ProjectState {
     return "12345";
   }
 
-  createUser(props: Omit<UserInfo, "localId" | "createdAt" | "lastRefreshAt">): UserInfo {
+  abstract get oneAccountPerEmail(): boolean;
+
+  abstract get authCloudFunction(): AuthCloudFunction;
+
+  abstract get allowPasswordSignup(): boolean;
+
+  abstract get disableAuth(): boolean;
+
+  abstract get mfaConfig(): Schemas["GoogleCloudIdentitytoolkitAdminV2MultiFactorAuthConfig"];
+
+  abstract get enableAnonymousUser(): boolean;
+
+  abstract get enableEmailLinkSignin(): boolean;
+
+  abstract shouldForwardCredentialToBlockingFunction(
+    type: "accessToken" | "idToken" | "refreshToken"
+  ): boolean;
+
+  abstract getBlockingFunctionUri(event: BlockingFunctionEvents): string | undefined;
+
+  generateLocalId(): string {
     for (let i = 0; i < 10; i++) {
       // Try this for 10 times to prevent ID collision (since our RNG is
       // Math.random() which isn't really that great).
       const localId = randomId(28);
-      const user = this.createUserWithLocalId(localId, props);
-      if (user) {
-        return user;
+      if (!this.users.has(localId) && !this.pendingLocalIds.has(localId)) {
+        // Create a pending localId until user is created. This creates a memory
+        // leak if a blocking functions throws and the localId is never used.
+        this.pendingLocalIds.add(localId);
+        return localId;
       }
     }
     // If we get 10 collisions in a row, there must be something very wrong.
@@ -63,12 +82,10 @@ export class ProjectState {
     if (this.users.has(localId)) {
       return undefined;
     }
-    const timestamp = new Date();
     this.users.set(localId, {
       localId,
-      createdAt: props.createdAt || timestamp.getTime().toString(),
-      lastLoginAt: timestamp.getTime().toString(),
     });
+    this.pendingLocalIds.delete(localId);
 
     const user = this.updateUserByLocalId(localId, props, {
       upsertProviders: props.providerUserInfo,
@@ -108,15 +125,6 @@ export class ProjectState {
   deleteUser(user: UserInfo): void {
     this.users.delete(user.localId);
     this.removeUserFromIndex(user);
-
-    const refreshTokens = this.refreshTokensForLocalId.get(user.localId);
-    if (refreshTokens) {
-      this.refreshTokensForLocalId.delete(user.localId);
-      for (const refreshToken of refreshTokens) {
-        this.refreshTokens.delete(refreshToken);
-      }
-    }
-
     this.authCloudFunction.dispatch("delete", user);
   }
 
@@ -375,31 +383,45 @@ export class ProjectState {
   createRefreshTokenFor(
     userInfo: UserInfo,
     provider: string,
-    extraClaims: Record<string, unknown> = {}
+    {
+      extraClaims = {},
+      secondFactor,
+    }: {
+      extraClaims?: Record<string, unknown>;
+      secondFactor?: SecondFactorRecord;
+    } = {}
   ): string {
     const localId = userInfo.localId;
-    const refreshToken = randomBase64UrlStr(204);
-    this.refreshTokens.set(refreshToken, { localId, provider, extraClaims });
-    let refreshTokens = this.refreshTokensForLocalId.get(localId);
-    if (!refreshTokens) {
-      refreshTokens = new Set();
-      this.refreshTokensForLocalId.set(localId, refreshTokens);
-    }
-    refreshTokens.add(refreshToken);
+    const refreshTokenRecord = {
+      _AuthEmulatorRefreshToken: "DO NOT MODIFY",
+      localId,
+      provider,
+      extraClaims,
+      projectId: this.projectId,
+      secondFactor,
+      tenantId: userInfo.tenantId,
+    };
+    const refreshToken = encodeRefreshToken(refreshTokenRecord);
     return refreshToken;
   }
 
-  validateRefreshToken(
-    refreshToken: string
-  ): { user: UserInfo; provider: string; extraClaims: Record<string, unknown> } | undefined {
-    const record = this.refreshTokens.get(refreshToken);
-    if (!record) {
-      return undefined;
+  validateRefreshToken(refreshToken: string): {
+    user: UserInfo;
+    provider: string;
+    extraClaims: Record<string, unknown>;
+    secondFactor?: SecondFactorRecord;
+  } {
+    const record = decodeRefreshToken(refreshToken);
+    assert(record.projectId === this.projectId, "INVALID_REFRESH_TOKEN");
+    if (this instanceof TenantProjectState) {
+      // Shouldn't ever reach this assertion, but adding for completeness
+      assert(record.tenantId === this.tenantId, "TENANT_ID_MISMATCH");
     }
     return {
       user: this.getUserByLocalIdAssertingExists(record.localId),
       provider: record.provider,
       extraClaims: record.extraClaims,
+      secondFactor: record.secondFactor,
     };
   }
 
@@ -462,8 +484,6 @@ export class ProjectState {
     this.localIdForPhoneNumber.clear();
     this.localIdsForProviderEmail.clear();
     this.userIdForProviderRawId.clear();
-    this.refreshTokens.clear();
-    this.refreshTokensForLocalId.clear();
 
     // We do not clear OOBs / phone verification codes since some of those may
     // still be valid (e.g. email link / phone sign-in may still create a new
@@ -523,7 +543,6 @@ export class ProjectState {
     if (!record || record.phoneNumber !== phoneNumber) {
       return undefined;
     }
-    // TODO: Find some way to enforce record.temporaryProofExpiresIn.
     return record;
   }
 
@@ -550,6 +569,257 @@ export class ProjectState {
     }
   }
 }
+
+export class AgentProjectState extends ProjectState {
+  private tenantProjectForTenantId: Map<string, TenantProjectState> = new Map();
+  private readonly _authCloudFunction = new AuthCloudFunction(this.projectId);
+  private _config: Config = {
+    signIn: { allowDuplicateEmails: false },
+    blockingFunctions: {},
+  };
+
+  constructor(projectId: string) {
+    super(projectId);
+  }
+
+  get authCloudFunction() {
+    return this._authCloudFunction;
+  }
+
+  get oneAccountPerEmail() {
+    return !this._config.signIn.allowDuplicateEmails;
+  }
+
+  set oneAccountPerEmail(oneAccountPerEmail: boolean) {
+    this._config.signIn.allowDuplicateEmails = !oneAccountPerEmail;
+  }
+
+  get allowPasswordSignup() {
+    return true;
+  }
+
+  get disableAuth() {
+    return false;
+  }
+
+  get mfaConfig() {
+    return { state: "ENABLED" as const, enabledProviders: ["PHONE_SMS" as const] };
+  }
+
+  get enableAnonymousUser() {
+    return true;
+  }
+
+  get enableEmailLinkSignin() {
+    return true;
+  }
+
+  get config() {
+    return this._config;
+  }
+
+  get blockingFunctionsConfig() {
+    return this._config.blockingFunctions;
+  }
+
+  set blockingFunctionsConfig(blockingFunctions: BlockingFunctionsConfig) {
+    this._config.blockingFunctions = blockingFunctions;
+  }
+
+  shouldForwardCredentialToBlockingFunction(
+    type: "accessToken" | "idToken" | "refreshToken"
+  ): boolean {
+    switch (type) {
+      case "accessToken":
+        return this._config.blockingFunctions.forwardInboundCredentials?.accessToken ?? false;
+      case "idToken":
+        return this._config.blockingFunctions.forwardInboundCredentials?.idToken ?? false;
+      case "refreshToken":
+        return this._config.blockingFunctions.forwardInboundCredentials?.refreshToken ?? false;
+    }
+  }
+
+  getBlockingFunctionUri(event: BlockingFunctionEvents): string | undefined {
+    const triggers = this.blockingFunctionsConfig.triggers;
+    if (triggers) {
+      return Object.prototype.hasOwnProperty.call(triggers, event)
+        ? triggers![event].functionUri
+        : undefined;
+    }
+    return undefined;
+  }
+
+  updateConfig(
+    update: Schemas["GoogleCloudIdentitytoolkitAdminV2Config"],
+    updateMask: string | undefined
+  ): Config {
+    // Empty masks indicate a full update.
+    if (!updateMask) {
+      this.oneAccountPerEmail = !update.signIn?.allowDuplicateEmails ?? true;
+      this.blockingFunctionsConfig = update.blockingFunctions ?? {};
+      return this.config;
+    }
+    return applyMask(updateMask, this.config, update);
+  }
+
+  getTenantProject(tenantId: string): TenantProjectState {
+    if (!this.tenantProjectForTenantId.has(tenantId)) {
+      // Implicitly creates tenant if it does not already exist and sets all
+      // configurations to enabled. This is for convenience and differs from
+      // production in which configurations, are default disabled. Tests that
+      // need to reflect production defaults should first explicitly call
+      // `createTenant()` with a `Tenant` object.
+      this.createTenantWithTenantId(tenantId, {
+        tenantId,
+        allowPasswordSignup: true,
+        disableAuth: false,
+        mfaConfig: {
+          state: "ENABLED",
+          enabledProviders: ["PHONE_SMS"],
+        },
+        enableAnonymousUser: true,
+        enableEmailLinkSignin: true,
+      });
+    }
+    return this.tenantProjectForTenantId.get(tenantId)!;
+  }
+
+  listTenants(startToken?: string): Tenant[] {
+    const tenantProjects = [];
+    for (const tenantProject of this.tenantProjectForTenantId.values()) {
+      if (!startToken || tenantProject.tenantId > startToken) {
+        tenantProjects.push(tenantProject);
+      }
+    }
+    // Sort in ascending order by tenantId
+    tenantProjects.sort((a, b) => {
+      if (a.tenantId < b.tenantId) {
+        return -1;
+      } else if (a.tenantId > b.tenantId) {
+        return 1;
+      }
+      return 0;
+    });
+    return tenantProjects.map((tenantProject) => tenantProject.tenantConfig);
+  }
+
+  createTenant(tenant: Tenant): Tenant {
+    for (let i = 0; i < 10; i++) {
+      const tenantId = randomId(28);
+      const createdTenant = this.createTenantWithTenantId(tenantId, tenant);
+      if (createdTenant) {
+        return createdTenant;
+      }
+    }
+    throw new Error("Could not generate a random unique tenantId after 10 tries");
+  }
+
+  private createTenantWithTenantId(tenantId: string, tenant: Tenant): Tenant | undefined {
+    if (this.tenantProjectForTenantId.has(tenantId)) {
+      return undefined;
+    }
+    tenant.name = `projects/${this.projectId}/tenants/${tenantId}`;
+    tenant.tenantId = tenantId;
+    this.tenantProjectForTenantId.set(
+      tenantId,
+      new TenantProjectState(this.projectId, tenantId, tenant, this)
+    );
+    return tenant;
+  }
+
+  deleteTenant(tenantId: string): void {
+    this.tenantProjectForTenantId.delete(tenantId);
+  }
+}
+
+export class TenantProjectState extends ProjectState {
+  constructor(
+    projectId: string,
+    readonly tenantId: string,
+    private _tenantConfig: Tenant,
+    private readonly parentProject: AgentProjectState
+  ) {
+    super(projectId);
+  }
+
+  get oneAccountPerEmail() {
+    return this.parentProject.oneAccountPerEmail;
+  }
+
+  get authCloudFunction() {
+    return this.parentProject.authCloudFunction;
+  }
+
+  get tenantConfig() {
+    return this._tenantConfig;
+  }
+
+  get allowPasswordSignup() {
+    return this._tenantConfig.allowPasswordSignup;
+  }
+
+  get disableAuth() {
+    return this._tenantConfig.disableAuth;
+  }
+
+  get mfaConfig() {
+    return this._tenantConfig.mfaConfig;
+  }
+
+  get enableAnonymousUser() {
+    return this._tenantConfig.enableAnonymousUser;
+  }
+
+  get enableEmailLinkSignin() {
+    return this._tenantConfig.enableEmailLinkSignin;
+  }
+
+  shouldForwardCredentialToBlockingFunction(
+    type: "accessToken" | "idToken" | "refreshToken"
+  ): boolean {
+    return this.parentProject.shouldForwardCredentialToBlockingFunction(type);
+  }
+
+  getBlockingFunctionUri(event: BlockingFunctionEvents): string | undefined {
+    return this.parentProject.getBlockingFunctionUri(event);
+  }
+
+  delete(): void {
+    this.parentProject.deleteTenant(this.tenantId);
+  }
+
+  updateTenant(
+    update: Schemas["GoogleCloudIdentitytoolkitAdminV2Tenant"],
+    updateMask: string | undefined
+  ): Tenant {
+    // Empty masks indicate a full update
+    if (!updateMask) {
+      const mfaConfig = update.mfaConfig ?? {};
+      if (!("state" in mfaConfig)) {
+        mfaConfig.state = "DISABLED";
+      }
+      if (!("enabledProviders" in mfaConfig)) {
+        mfaConfig.enabledProviders = [];
+      }
+
+      // Default to production defaults if unset
+      this._tenantConfig = {
+        tenantId: this.tenantId,
+        name: this.tenantConfig.name,
+        allowPasswordSignup: update.allowPasswordSignup ?? false,
+        disableAuth: update.disableAuth ?? false,
+        mfaConfig: mfaConfig as MfaConfig,
+        enableAnonymousUser: update.enableAnonymousUser ?? false,
+        enableEmailLinkSignin: update.enableEmailLinkSignin ?? false,
+        displayName: update.displayName,
+      };
+      return this.tenantConfig;
+    }
+
+    return applyMask(updateMask, this.tenantConfig, update);
+  }
+}
+
 export type ProviderUserInfo = MakeRequired<
   Schemas["GoogleCloudIdentitytoolkitV1ProviderUserInfo"],
   "rawId" | "providerId"
@@ -561,11 +831,48 @@ export type UserInfo = Omit<
   localId: string;
   providerUserInfo?: ProviderUserInfo[];
 };
+export type MfaConfig = MakeRequired<
+  Schemas["GoogleCloudIdentitytoolkitAdminV2MultiFactorAuthConfig"],
+  "enabledProviders" | "state"
+>;
+export type Tenant = Omit<
+  MakeRequired<
+    Schemas["GoogleCloudIdentitytoolkitAdminV2Tenant"],
+    "allowPasswordSignup" | "disableAuth" | "enableAnonymousUser" | "enableEmailLinkSignin"
+  >,
+  "testPhoneNumbers" | "mfaConfig"
+> & { tenantId: string; mfaConfig: MfaConfig };
 
-interface RefreshTokenRecord {
+export type SignInConfig = MakeRequired<
+  Schemas["GoogleCloudIdentitytoolkitAdminV2SignInConfig"],
+  "allowDuplicateEmails"
+>;
+
+export type BlockingFunctionsConfig =
+  Schemas["GoogleCloudIdentitytoolkitAdminV2BlockingFunctionsConfig"];
+
+// Serves as a substitute for Schemas["GoogleCloudIdentitytoolkitAdminV2Config"],
+// i.e. the configuration object for top-level AgentProjectStates. Emulator
+// fixes certain configurations for ease of use / testing, so as non-standard
+// behavior, Config only stores the configurable fields.
+export type Config = {
+  signIn: SignInConfig;
+  blockingFunctions: BlockingFunctionsConfig;
+};
+
+export interface RefreshTokenRecord {
+  _AuthEmulatorRefreshToken: string;
   localId: string;
   provider: string;
   extraClaims: Record<string, unknown>;
+  projectId: string;
+  secondFactor?: SecondFactorRecord;
+  tenantId?: string;
+}
+
+export interface SecondFactorRecord {
+  identifier: string;
+  provider: string;
 }
 
 export type OobRequestType = NonNullable<
@@ -585,10 +892,33 @@ export interface PhoneVerificationRecord {
   sessionInfo: string;
 }
 
+export enum BlockingFunctionEvents {
+  BEFORE_CREATE = "beforeCreate",
+  BEFORE_SIGN_IN = "beforeSignIn",
+}
+
 interface TemporaryProofRecord {
   phoneNumber: string;
   temporaryProof: string;
   temporaryProofExpiresIn: string;
+  // Temporary proofs in emulator never expire to make interactive debugging
+  // a bit easier. Therefore, there's no need to record createdAt timestamps.
+}
+
+export function encodeRefreshToken(refreshTokenRecord: RefreshTokenRecord): string {
+  return Buffer.from(JSON.stringify(refreshTokenRecord), "utf8").toString("base64");
+}
+
+export function decodeRefreshToken(refreshTokenString: string): RefreshTokenRecord {
+  let refreshTokenRecord: RefreshTokenRecord;
+  try {
+    const json = Buffer.from(refreshTokenString, "base64").toString("utf8");
+    refreshTokenRecord = JSON.parse(json) as RefreshTokenRecord;
+  } catch {
+    throw new BadRequestError("INVALID_REFRESH_TOKEN");
+  }
+  assert(refreshTokenRecord._AuthEmulatorRefreshToken, "INVALID_REFRESH_TOKEN");
+  return refreshTokenRecord;
 }
 
 function getProviderEmailsForUser(user: UserInfo): Set<string> {
@@ -599,4 +929,59 @@ function getProviderEmailsForUser(user: UserInfo): Set<string> {
     }
   });
   return emails;
+}
+
+/**
+ * Updates fields based on specified update mask. Note that this is a no-op if
+ * the update mask is empty.
+ *
+ * @param updateMask a comma separated list of fully qualified names of fields
+ * @param dest the destination to apply updates to
+ * @param update the updates to apply
+ * @returns the updated destination object
+ */
+function applyMask<T>(updateMask: string, dest: T, update: DeepPartial<T>): T {
+  const paths = updateMask.split(",");
+  for (const path of paths) {
+    const fields = path.split(".");
+    // Using `any` here to recurse over destination objects
+    let updateField: any = update;
+    let existingField: any = dest;
+    let field;
+    for (let i = 0; i < fields.length - 1; i++) {
+      field = fields[i];
+
+      // Doesn't exist on update
+      if (updateField[field] == null) {
+        console.warn(`Unable to find field '${field}' in update '${updateField}`);
+        break;
+      }
+
+      // Field on existing is an array or is a primitive (i.e. cannot index
+      // any further)
+      if (Array.isArray(updateField[field]) || Object(updateField[field]) !== updateField[field]) {
+        console.warn(`Field '${field}' is singular and cannot have sub-fields`);
+        break;
+      }
+
+      // Non-standard behavior, this creates new fields regardless of if the
+      // final field is set. Typical behavior would not modify the config
+      // payload if the final field is not successfully set.
+      if (!existingField[field]) {
+        existingField[field] = {};
+      }
+
+      updateField = updateField[field];
+      existingField = existingField[field];
+    }
+    // Reassign final field if possible
+    field = fields[fields.length - 1];
+    if (updateField[field] == null) {
+      console.warn(`Unable to find field '${field}' in update '${JSON.stringify(updateField)}`);
+      continue;
+    }
+    existingField[field] = updateField[field];
+  }
+
+  return dest;
 }

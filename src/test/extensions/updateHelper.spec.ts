@@ -5,12 +5,11 @@ import * as sinon from "sinon";
 import { FirebaseError } from "../../error";
 import { firebaseExtensionsRegistryOrigin } from "../../api";
 import * as extensionsApi from "../../extensions/extensionsApi";
+import { ExtensionSpec, Resource } from "../../extensions/types";
 import * as extensionsHelper from "../../extensions/extensionsHelper";
-import * as prompt from "../../prompt";
-import * as resolveSource from "../../extensions/resolveSource";
 import * as updateHelper from "../../extensions/updateHelper";
 
-const SPEC = {
+const SPEC: ExtensionSpec = {
   name: "test",
   displayName: "Old",
   description: "descriptive",
@@ -26,7 +25,7 @@ const SPEC = {
   ],
   resources: [
     { name: "resource1", type: "firebaseextensions.v1beta.function", description: "desc" },
-    { name: "resource2", type: "other", description: "" },
+    { name: "resource2", type: "other", description: "" } as unknown as Resource,
   ],
   author: { authorName: "Tester" },
   contributors: [{ authorName: "Tester 2" }],
@@ -34,8 +33,6 @@ const SPEC = {
   sourceUrl: "test.com",
   params: [],
 };
-
-const OLD_SPEC = Object.assign({}, SPEC, { version: "0.1.0" });
 
 const SOURCE = {
   name: "projects/firebasemods/sources/new-test-source",
@@ -61,55 +58,13 @@ const EXTENSION = {
   latestVersion: "0.2.0",
 };
 
-const REGISTRY_ENTRY = {
-  name: "test",
-  labels: {
-    latest: "0.2.0",
-    minRequired: "0.1.1",
-  },
-  versions: {
-    "0.1.0": "projects/firebasemods/sources/2kd",
-    "0.1.1": "projects/firebasemods/sources/xyz",
-    "0.1.2": "projects/firebasemods/sources/123",
-    "0.2.0": "projects/firebasemods/sources/abc",
-  },
-  updateWarnings: {
-    ">0.1.0 <0.2.0": [
-      {
-        from: "0.1.0",
-        description:
-          "Starting Jan 15, HTTP functions will be private by default. [Learn more](https://someurl.com)",
-        action:
-          "After updating, it is highly recommended that you switch your Cloud Scheduler jobs to <b>PubSub</b>",
-      },
-    ],
-    ">=0.2.0": [
-      {
-        from: "0.1.0",
-        description:
-          "Starting Jan 15, HTTP functions will be private by default. [Learn more](https://someurl.com)",
-        action:
-          "After updating, you must switch your Cloud Scheduler jobs to <b>PubSub</b>, otherwise your extension will stop running.",
-      },
-      {
-        from: ">0.1.0",
-        description:
-          "Starting Jan 15, HTTP functions will be private by default. [Learn more](https://someurl.com)",
-        action:
-          "If you have not already done so during a previous update, after updating, you must switch your Cloud Scheduler jobs to <b>PubSub</b>, otherwise your extension will stop running.",
-      },
-    ],
-  },
-};
-
 const INSTANCE = {
   name: "projects/invader-zim/instances/instance-of-official-ext",
   createTime: "2019-05-19T00:20:10.416947Z",
   updateTime: "2019-05-19T00:20:10.416947Z",
   state: "ACTIVE",
   config: {
-    name:
-      "projects/invader-zim/instances/instance-of-official-ext/configurations/95355951-397f-4821-a5c2-9c9788b2cc63",
+    name: "projects/invader-zim/instances/instance-of-official-ext/configurations/95355951-397f-4821-a5c2-9c9788b2cc63",
     createTime: "2019-05-19T00:20:10.416947Z",
     sourceId: "fake-official-source",
     sourceName: "projects/firebasemods/sources/fake-official-source",
@@ -125,8 +80,7 @@ const REGISTRY_INSTANCE = {
   updateTime: "2019-05-19T00:20:10.416947Z",
   state: "ACTIVE",
   config: {
-    name:
-      "projects/invader-zim/instances/instance-of-registry-ext/configurations/95355951-397f-4821-a5c2-9c9788b2cc63",
+    name: "projects/invader-zim/instances/instance-of-registry-ext/configurations/95355951-397f-4821-a5c2-9c9788b2cc63",
     createTime: "2019-05-19T00:20:10.416947Z",
     sourceId: "fake-registry-source",
     sourceName: "projects/firebasemods/sources/fake-registry-source",
@@ -143,8 +97,7 @@ const LOCAL_INSTANCE = {
   updateTime: "2019-05-19T00:20:10.416947Z",
   state: "ACTIVE",
   config: {
-    name:
-      "projects/invader-zim/instances/instance-of-local-ext/configurations/95355951-397f-4821-a5c2-9c9788b2cc63",
+    name: "projects/invader-zim/instances/instance-of-local-ext/configurations/95355951-397f-4821-a5c2-9c9788b2cc63",
     createTime: "2019-05-19T00:20:10.416947Z",
     sourceId: "fake-registry-source",
     sourceName: "projects/firebasemods/sources/fake-local-source",
@@ -156,12 +109,10 @@ const LOCAL_INSTANCE = {
 
 describe("updateHelper", () => {
   describe("updateFromLocalSource", () => {
-    let promptStub: sinon.SinonStub;
     let createSourceStub: sinon.SinonStub;
     let getInstanceStub: sinon.SinonStub;
 
     beforeEach(() => {
-      promptStub = sinon.stub(prompt, "promptOnce");
       createSourceStub = sinon.stub(extensionsHelper, "createSourceFromLocation");
       getInstanceStub = sinon.stub(extensionsApi, "getInstance").resolves(INSTANCE);
 
@@ -170,7 +121,6 @@ describe("updateHelper", () => {
     });
 
     afterEach(() => {
-      promptStub.restore();
       createSourceStub.restore();
       getInstanceStub.restore();
 
@@ -178,42 +128,29 @@ describe("updateHelper", () => {
     });
 
     it("should return the correct source name for a valid local source", async () => {
-      promptStub.resolves(true);
       createSourceStub.resolves(SOURCE);
       const name = await updateHelper.updateFromLocalSource(
         "test-project",
         "test-instance",
         ".",
-        SPEC,
-        SPEC.name
+        SPEC
       );
       expect(name).to.equal(SOURCE.name);
     });
 
     it("should throw an error for an invalid source", async () => {
-      promptStub.resolves(true);
       createSourceStub.throwsException("Invalid source");
       await expect(
-        updateHelper.updateFromLocalSource("test-project", "test-instance", ".", SPEC, SPEC.name)
+        updateHelper.updateFromLocalSource("test-project", "test-instance", ".", SPEC)
       ).to.be.rejectedWith(FirebaseError, "Unable to update from the source");
-    });
-
-    it("should not update if the update warning is not confirmed", async () => {
-      promptStub.resolves(false);
-      createSourceStub.resolves(SOURCE);
-      await expect(
-        updateHelper.updateFromLocalSource("test-project", "test-instance", ".", SPEC, SPEC.name)
-      ).to.be.rejectedWith(FirebaseError, "Update cancelled.");
     });
   });
 
   describe("updateFromUrlSource", () => {
-    let promptStub: sinon.SinonStub;
     let createSourceStub: sinon.SinonStub;
     let getInstanceStub: sinon.SinonStub;
 
     beforeEach(() => {
-      promptStub = sinon.stub(prompt, "promptOnce");
       createSourceStub = sinon.stub(extensionsHelper, "createSourceFromLocation");
       getInstanceStub = sinon.stub(extensionsApi, "getInstance").resolves(INSTANCE);
 
@@ -222,7 +159,6 @@ describe("updateHelper", () => {
     });
 
     afterEach(() => {
-      promptStub.restore();
       createSourceStub.restore();
       getInstanceStub.restore();
 
@@ -230,80 +166,50 @@ describe("updateHelper", () => {
     });
 
     it("should return the correct source name for a valid url source", async () => {
-      promptStub.resolves(true);
       createSourceStub.resolves(SOURCE);
       const name = await updateHelper.updateFromUrlSource(
         "test-project",
         "test-instance",
         "https://valid-source.tar.gz",
-        SPEC,
-        SPEC.name
+        SPEC
       );
       expect(name).to.equal(SOURCE.name);
     });
 
     it("should throw an error for an invalid source", async () => {
-      promptStub.resolves(true);
       createSourceStub.throws("Invalid source");
       await expect(
         updateHelper.updateFromUrlSource(
           "test-project",
           "test-instance",
           "https://valid-source.tar.gz",
-          SPEC,
-          SPEC.name
+          SPEC
         )
       ).to.be.rejectedWith(FirebaseError, "Unable to update from the source");
-    });
-
-    it("should not update if the update warning is not confirmed", async () => {
-      promptStub.resolves(false);
-      createSourceStub.resolves(SOURCE);
-      await expect(
-        updateHelper.updateFromUrlSource(
-          "test-project",
-          "test-instance",
-          "https://valid-source.tar.gz",
-          SPEC,
-          SPEC.name
-        )
-      ).to.be.rejectedWith(FirebaseError, "Update cancelled.");
     });
   });
 
   describe("updateToVersionFromPublisherSource", () => {
-    let promptStub: sinon.SinonStub;
     let getExtensionStub: sinon.SinonStub;
     let createSourceStub: sinon.SinonStub;
     let listExtensionVersionStub: sinon.SinonStub;
-    let registryStub: sinon.SinonStub;
-    let isOfficialStub: sinon.SinonStub;
     let getInstanceStub: sinon.SinonStub;
 
     beforeEach(() => {
-      promptStub = sinon.stub(prompt, "promptOnce");
       getExtensionStub = sinon.stub(extensionsApi, "getExtension");
       createSourceStub = sinon.stub(extensionsApi, "getExtensionVersion");
       listExtensionVersionStub = sinon.stub(extensionsApi, "listExtensionVersions");
-      registryStub = sinon.stub(resolveSource, "resolveRegistryEntry");
-      registryStub.resolves(REGISTRY_ENTRY);
-      isOfficialStub = sinon.stub(resolveSource, "isOfficialSource");
-      isOfficialStub.returns(false);
       getInstanceStub = sinon.stub(extensionsApi, "getInstance").resolves(REGISTRY_INSTANCE);
     });
 
     afterEach(() => {
-      promptStub.restore();
       getExtensionStub.restore();
       createSourceStub.restore();
       listExtensionVersionStub.restore();
-      registryStub.restore();
-      isOfficialStub.restore();
       getInstanceStub.restore();
     });
 
     it("should return the correct source name for a valid published extension version source", async () => {
-      promptStub.resolves(true);
       getExtensionStub.resolves(EXTENSION);
       createSourceStub.resolves(EXTENSION_VERSION);
       listExtensionVersionStub.resolves([]);
@@ -311,14 +217,12 @@ describe("updateHelper", () => {
         "test-project",
         "test-instance",
         "test-publisher/test@0.2.0",
-        SPEC,
-        SPEC.name
+        SPEC
       );
       expect(name).to.equal(EXTENSION_VERSION.name);
     });
 
     it("should throw an error for an invalid source", async () => {
-      promptStub.resolves(true);
       getExtensionStub.throws(Error("NOT FOUND"));
       createSourceStub.throws(Error("NOT FOUND"));
       listExtensionVersionStub.resolves([]);
@@ -327,62 +231,33 @@ describe("updateHelper", () => {
           "test-project",
           "test-instance",
           "test-publisher/test@1.2.3",
-          SPEC,
-          SPEC.name
+          SPEC
         )
       ).to.be.rejectedWith("NOT FOUND");
-    });
-
-    it("should not update if the update warning is not confirmed", async () => {
-      promptStub.resolves(false);
-      getExtensionStub.resolves(EXTENSION);
-      createSourceStub.resolves(EXTENSION_VERSION);
-      listExtensionVersionStub.resolves([]);
-      await expect(
-        updateHelper.updateToVersionFromPublisherSource(
-          "test-project",
-          "test-instance",
-          "test-publisher/test@0.2.0",
-          SPEC,
-          SPEC.name
-        )
-      ).to.be.rejectedWith(FirebaseError, "Update cancelled.");
     });
   });
 
   describe("updateFromPublisherSource", () => {
-    let promptStub: sinon.SinonStub;
     let getExtensionStub: sinon.SinonStub;
     let createSourceStub: sinon.SinonStub;
     let listExtensionVersionStub: sinon.SinonStub;
-    let registryStub: sinon.SinonStub;
-    let isOfficialStub: sinon.SinonStub;
     let getInstanceStub: sinon.SinonStub;
 
     beforeEach(() => {
-      promptStub = sinon.stub(prompt, "promptOnce");
       getExtensionStub = sinon.stub(extensionsApi, "getExtension");
       createSourceStub = sinon.stub(extensionsApi, "getExtensionVersion");
       listExtensionVersionStub = sinon.stub(extensionsApi, "listExtensionVersions");
-      registryStub = sinon.stub(resolveSource, "resolveRegistryEntry");
-      registryStub.resolves(REGISTRY_ENTRY);
-      isOfficialStub = sinon.stub(resolveSource, "isOfficialSource");
-      isOfficialStub.returns(false);
       getInstanceStub = sinon.stub(extensionsApi, "getInstance").resolves(REGISTRY_INSTANCE);
     });
 
     afterEach(() => {
-      promptStub.restore();
       getExtensionStub.restore();
       createSourceStub.restore();
       listExtensionVersionStub.restore();
-      registryStub.restore();
-      isOfficialStub.restore();
       getInstanceStub.restore();
     });
 
     it("should return the correct source name for the latest published extension source", async () => {
-      promptStub.resolves(true);
       getExtensionStub.resolves(EXTENSION);
       createSourceStub.resolves(EXTENSION_VERSION);
       listExtensionVersionStub.resolves([]);
@@ -390,14 +265,12 @@ describe("updateHelper", () => {
         "test-project",
         "test-instance",
         "test-publisher/test",
-        SPEC,
-        SPEC.name
+        SPEC
       );
       expect(name).to.equal(EXTENSION_VERSION.name);
     });
 
     it("should throw an error for an invalid source", async () => {
-      promptStub.resolves(true);
       getExtensionStub.throws(Error("NOT FOUND"));
       createSourceStub.throws(Error("NOT FOUND"));
       listExtensionVersionStub.resolves([]);
@@ -406,26 +279,9 @@ describe("updateHelper", () => {
           "test-project",
           "test-instance",
           "test-publisher/test",
-          SPEC,
-          SPEC.name
+          SPEC
         )
       ).to.be.rejectedWith("NOT FOUND");
-    });
-
-    it("should not update if the update warning is not confirmed", async () => {
-      promptStub.resolves(false);
-      getExtensionStub.resolves(EXTENSION);
-      createSourceStub.resolves(EXTENSION_VERSION);
-      listExtensionVersionStub.resolves([]);
-      await expect(
-        updateHelper.updateToVersionFromPublisherSource(
-          "test-project",
-          "test-instance",
-          "test-publisher/test",
-          SPEC,
-          SPEC.name
-        )
-      ).to.be.rejectedWith(FirebaseError, "Update cancelled.");
     });
   });
 });
@@ -470,9 +326,7 @@ describe("getExistingSourceOrigin", () => {
 
     const result = await updateHelper.getExistingSourceOrigin(
       "invader-zim",
-      "instance-of-registry-ext",
-      "ext-testing",
-      "projects/firebasemods/sources/fake-registry-source"
+      "instance-of-registry-ext"
     );
 
     expect(result).to.equal(extensionsHelper.SourceOrigin.PUBLISHED_EXTENSION);
@@ -483,9 +337,7 @@ describe("getExistingSourceOrigin", () => {
 
     const result = await updateHelper.getExistingSourceOrigin(
       "invader-zim",
-      "instance-of-local-ext",
-      "ext-testing",
-      "projects/firebasemods/sources/fake-local-source"
+      "instance-of-local-ext"
     );
 
     expect(result).to.equal(extensionsHelper.SourceOrigin.LOCAL);

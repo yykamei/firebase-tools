@@ -1,16 +1,19 @@
-import * as clc from "cli-color";
+import * as clc from "colorette";
 import * as fs from "fs";
 import * as path from "path";
 
 import { FirebaseError } from "../error";
 import { logger } from "../logger";
-import { previews } from "../previews";
 import { logBullet } from "../utils";
 
+const FUNCTIONS_EMULATOR_DOTENV = ".env.local";
+
+const RESERVED_PREFIXES = ["X_GOOGLE_", "FIREBASE_", "EXT_"];
 const RESERVED_KEYS = [
   // Cloud Functions for Firebase
   "FIREBASE_CONFIG",
   "CLOUD_RUNTIME_CONFIG",
+  "EVENTARC_CLOUD_EVENT_SOURCE",
   // Cloud Functions - old runtimes:
   //   https://cloud.google.com/functions/docs/env-var#nodejs_8_python_37_and_go_111
   "ENTRY_POINT",
@@ -43,17 +46,39 @@ const LINE_RE = new RegExp(
   "^" +                      // begin line
   "\\s*" +                   //   leading whitespaces
   "(\\w+)" +                 //   key
-  "\\s*=\\s*" +              //   separator (=)
+  "\\s*=[\\f\\t\\v]*" +              //   separator (=)
   "(" +                      //   begin optional value
   "\\s*'(?:\\\\'|[^'])*'|" + //     single quoted or
   '\\s*"(?:\\\\"|[^"])*"|' + //     double quoted or
-  "[^\\#\\r\\n]+" +          //     unquoted
+  "[^#\\r\\n]*" +           //     unquoted
   ")?" +                     //   end optional value
   "\\s*" +                   //   trailing whitespaces
   "(?:#[^\\n]*)?" +          //   optional comment
   "$",                       // end line
   "gms"                      // flags: global, multiline, dotall
 );
+
+const ESCAPE_SEQUENCES_TO_CHARACTERS: Record<string, string> = {
+  "\\n": "\n",
+  "\\r": "\r",
+  "\\t": "\t",
+  "\\v": "\v",
+  "\\\\": "\\",
+  "\\'": "'",
+  '\\"': '"',
+};
+const ALL_ESCAPE_SEQUENCES_RE = /\\[nrtv\\'"]/g;
+
+const CHARACTERS_TO_ESCAPE_SEQUENCES: Record<string, string> = {
+  "\n": "\\n",
+  "\r": "\\r",
+  "\t": "\\t",
+  "\v": "\\v",
+  "\\": "\\\\",
+  "'": "\\'",
+  '"': '\\"',
+};
+const ALL_ESCAPABLE_CHARACTERS_RE = /[\n\r\t\v\\'"]/g;
 
 interface ParseResult {
   envs: Record<string, string>;
@@ -101,12 +126,12 @@ export function parse(data: string): ParseResult {
       // Remove surrounding single/double quotes.
       v = quotesMatch[2];
       if (quotesMatch[1] === '"') {
-        // Unescape newlines and tabs.
-        v = v.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t").replace("\\v", "\v");
-        // Unescape other escapable characters.
-        v = v.replace(/\\([\\'"])/g, "$1");
+        // Substitute escape sequences. The regex passed to replace() must
+        // match every key in ESCAPE_SEQUENCES_TO_CHARACTERS.
+        v = v.replace(ALL_ESCAPE_SEQUENCES_RE, (match) => ESCAPE_SEQUENCES_TO_CHARACTERS[match]);
       }
     }
+
     envs[k] = v;
   }
 
@@ -123,7 +148,11 @@ export function parse(data: string): ParseResult {
   return { envs, errors };
 }
 
-class KeyValidationError extends Error {}
+export class KeyValidationError extends Error {
+  constructor(public key: string, public message: string) {
+    super(`Failed to validate key ${key}: ${message}`);
+  }
+}
 
 /**
  * Validates string for use as an env var key.
@@ -133,25 +162,29 @@ class KeyValidationError extends Error {}
  */
 export function validateKey(key: string): void {
   if (RESERVED_KEYS.includes(key)) {
-    throw new KeyValidationError(`Key ${key} is reserved for internal use.`);
+    throw new KeyValidationError(key, `Key ${key} is reserved for internal use.`);
   }
   if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) {
     throw new KeyValidationError(
+      key,
       `Key ${key} must start with an uppercase ASCII letter or underscore` +
         ", and then consist of uppercase ASCII letters, digits, and underscores."
     );
   }
-  if (key.startsWith("X_GOOGLE_") || key.startsWith("FIREBASE_")) {
+  if (RESERVED_PREFIXES.some((prefix) => key.startsWith(prefix))) {
     throw new KeyValidationError(
-      `Key ${key} starts with a reserved prefix (X_GOOGLE_ or FIREBASE_)`
+      key,
+      `Key ${key} starts with a reserved prefix (${RESERVED_PREFIXES.join(" ")})`
     );
   }
 }
 
-// Parse dotenv file, but throw errors if:
-//   1. Input has any invalid lines.
-//   2. Any env key fails validation.
-function parseStrict(data: string): Record<string, string> {
+/**
+ * Parse dotenv file, but throw errors if:
+ * 1. Input has any invalid lines.
+ * 2. Any env key fails validation.
+ */
+export function parseStrict(data: string): Record<string, string> {
   const { envs, errors } = parse(data);
 
   if (errors.length) {
@@ -162,7 +195,7 @@ function parseStrict(data: string): Record<string, string> {
   for (const key of Object.keys(envs)) {
     try {
       validateKey(key);
-    } catch (err) {
+    } catch (err: any) {
       logger.debug(`Failed to validate key ${key}: ${err}`);
       if (err instanceof KeyValidationError) {
         validationErrors.push(err);
@@ -179,10 +212,19 @@ function parseStrict(data: string): Record<string, string> {
   return envs;
 }
 
-function findEnvfiles(functionsSource: string, projectId: string, projectAlias?: string): string[] {
-  const files = [".env", `.env.${projectId}`];
-  if (projectAlias && projectAlias.length) {
+function findEnvfiles(
+  functionsSource: string,
+  projectId: string,
+  projectAlias?: string,
+  isEmulator?: boolean
+): string[] {
+  const files: string[] = [".env"];
+  files.push(`.env.${projectId}`);
+  if (projectAlias) {
     files.push(`.env.${projectAlias}`);
+  }
+  if (isEmulator) {
+    files.push(FUNCTIONS_EMULATOR_DOTENV);
   }
 
   return files
@@ -195,6 +237,7 @@ export interface UserEnvsOpts {
   functionsSource: string;
   projectId: string;
   projectAlias?: string;
+  isEmulator?: boolean;
 }
 
 /**
@@ -202,8 +245,74 @@ export interface UserEnvsOpts {
  *
  * @return True if there are any user-specified environment variables
  */
-export function hasUserEnvs({ functionsSource, projectId, projectAlias }: UserEnvsOpts): boolean {
-  return findEnvfiles(functionsSource, projectId, projectAlias).length > 0;
+export function hasUserEnvs({
+  functionsSource,
+  projectId,
+  projectAlias,
+  isEmulator,
+}: UserEnvsOpts): boolean {
+  return findEnvfiles(functionsSource, projectId, projectAlias, isEmulator).length > 0;
+}
+
+/**
+ * Write new environment variables into a dotenv file.
+ *
+ * Identifies one and only one dotenv file to touch using the same rules as loadUserEnvs().
+ * It is an error to provide a key-value pair which is already in the file.
+ */
+export function writeUserEnvs(toWrite: Record<string, string>, envOpts: UserEnvsOpts) {
+  if (Object.keys(toWrite).length === 0) {
+    return;
+  }
+
+  const { functionsSource, projectId, projectAlias, isEmulator } = envOpts;
+  const envFiles = findEnvfiles(functionsSource, projectId, projectAlias, isEmulator);
+  const projectScopedFileName = `.env.${projectId}`;
+
+  const projectScopedFileExists = envFiles.includes(projectScopedFileName);
+  if (!projectScopedFileExists) {
+    createEnvFile(envOpts);
+  }
+
+  const currentEnvs = loadUserEnvs(envOpts);
+  for (const k of Object.keys(toWrite)) {
+    validateKey(k);
+    if (currentEnvs.hasOwnProperty(k)) {
+      throw new FirebaseError(
+        `Attempted to write param-defined key ${k} to .env files, but it was already defined.`
+      );
+    }
+  }
+
+  logBullet(
+    clc.cyan(clc.bold("functions: ")) +
+      `Writing new parameter values to disk: ${projectScopedFileName}`
+  );
+  for (const k of Object.keys(toWrite)) {
+    fs.appendFileSync(
+      path.join(functionsSource, projectScopedFileName),
+      formatUserEnvForWrite(k, toWrite[k])
+    );
+  }
+}
+
+function createEnvFile(envOpts: UserEnvsOpts): string {
+  const fileToWrite = envOpts.isEmulator ? FUNCTIONS_EMULATOR_DOTENV : `.env.${envOpts.projectId}`;
+  logger.debug(`Creating ${fileToWrite}...`);
+
+  fs.writeFileSync(path.join(envOpts.functionsSource, fileToWrite), "", { flag: "wx" });
+  return fileToWrite;
+}
+
+function formatUserEnvForWrite(key: string, value: string): string {
+  const escapedValue = value.replace(
+    ALL_ESCAPABLE_CHARACTERS_RE,
+    (match) => CHARACTERS_TO_ESCAPE_SEQUENCES[match]
+  );
+  if (escapedValue !== value) {
+    return `${key}="${escapedValue}"\n`;
+  }
+  return `${key}=${escapedValue}\n`;
 }
 
 /**
@@ -225,13 +334,10 @@ export function loadUserEnvs({
   functionsSource,
   projectId,
   projectAlias,
+  isEmulator,
 }: UserEnvsOpts): Record<string, string> {
-  if (!previews.dotenv) {
-    return {};
-  }
-
-  const envFiles = findEnvfiles(functionsSource, projectId, projectAlias);
-  if (envFiles.length == 0) {
+  const envFiles = findEnvfiles(functionsSource, projectId, projectAlias, isEmulator);
+  if (envFiles.length === 0) {
     return {};
   }
 
@@ -250,7 +356,7 @@ export function loadUserEnvs({
     try {
       const data = fs.readFileSync(path.join(functionsSource, f), "utf8");
       envs = { ...envs, ...parseStrict(data) };
-    } catch (err) {
+    } catch (err: any) {
       throw new FirebaseError(`Failed to load environment variables from ${f}.`, {
         exit: 2,
         children: err.children?.length > 0 ? err.children : [err],
@@ -258,7 +364,7 @@ export function loadUserEnvs({
     }
   }
   logBullet(
-    clc.cyan.bold("functions: ") + `Loaded environment variables from ${envFiles.join(", ")}.`
+    clc.cyan(clc.bold("functions: ")) + `Loaded environment variables from ${envFiles.join(", ")}.`
   );
 
   return envs;

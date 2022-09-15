@@ -1,9 +1,15 @@
 import { expect } from "chai";
 import { decode as decodeJwt, JwtHeader } from "jsonwebtoken";
-import { UserInfo } from "../../../emulator/auth/state";
+import {
+  decodeRefreshToken,
+  encodeRefreshToken,
+  RefreshTokenRecord,
+  UserInfo,
+} from "../../../emulator/auth/state";
 import {
   getAccountInfoByIdToken,
   PROJECT_ID,
+  registerTenant,
   signInWithPhoneNumber,
   TEST_PHONE_NUMBER,
 } from "./helpers";
@@ -44,6 +50,40 @@ describeAuthEmulator("token refresh", ({ authApi, getClock }) => {
       });
   });
 
+  it("should exchange refresh tokens for new tokens in a tenant project", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, {
+      disableAuth: false,
+      allowPasswordSignup: true,
+    });
+    const { refreshToken, localId } = await registerUser(authApi(), {
+      email: "alice@example.com",
+      password: "notasecret",
+      tenantId: tenant.tenantId,
+    });
+
+    await authApi()
+      .post("/securetoken.googleapis.com/v1/token")
+      .type("form")
+      // snake_case parameters also work, per OAuth 2.0 spec.
+      .send({ refresh_token: refreshToken, grantType: "refresh_token" })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(200, res);
+        expect(res.body.id_token).to.be.a("string");
+        expect(res.body.access_token).to.equal(res.body.id_token);
+        expect(res.body.refresh_token).to.be.a("string");
+        expect(res.body.expires_in)
+          .to.be.a("string")
+          .matches(/[0-9]+/);
+        expect(res.body.project_id).to.equal("12345");
+        expect(res.body.token_type).to.equal("Bearer");
+        expect(res.body.user_id).to.equal(localId);
+
+        const refreshTokenRecord = decodeRefreshToken(res.body.refresh_token);
+        expect(refreshTokenRecord.tenantId).to.equal(tenant.tenantId);
+      });
+  });
+
   it("should populate auth_time to match lastLoginAt (in seconds since epoch)", async () => {
     getClock().tick(444); // Make timestamps a bit more interesting (non-zero).
     const emailUser = { email: "alice@example.com", password: "notasecret" };
@@ -72,6 +112,62 @@ describeAuthEmulator("token refresh", ({ authApi, getClock }) => {
     expect(decoded!.payload.auth_time).to.equal(lastLoginAtSeconds);
   });
 
+  it("should error if grant type is missing", async () => {
+    const { refreshToken } = await registerAnonUser(authApi());
+
+    await authApi()
+      .post("/securetoken.googleapis.com/v1/token")
+      .type("form")
+      // snake_case parameters also work, per OAuth 2.0 spec.
+      .send({ refresh_token: refreshToken })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error.message).to.contain("MISSING_GRANT_TYPE");
+      });
+  });
+
+  it("should error if grant type is not refresh_token", async () => {
+    const { refreshToken } = await registerAnonUser(authApi());
+
+    await authApi()
+      .post("/securetoken.googleapis.com/v1/token")
+      .type("form")
+      // snake_case parameters also work, per OAuth 2.0 spec.
+      .send({ refresh_token: refreshToken, grantType: "other_grant_type" })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error.message).to.contain("INVALID_GRANT_TYPE");
+      });
+  });
+
+  it("should error if refresh token is missing", async () => {
+    await authApi()
+      .post("/securetoken.googleapis.com/v1/token")
+      .type("form")
+      // snake_case parameters also work, per OAuth 2.0 spec.
+      .send({ grantType: "refresh_token" })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error.message).to.contain("MISSING_REFRESH_TOKEN");
+      });
+  });
+
+  it("should error on malformed refresh tokens", async () => {
+    await authApi()
+      .post("/securetoken.googleapis.com/v1/token")
+      .type("form")
+      // snake_case parameters also work, per OAuth 2.0 spec.
+      .send({ refresh_token: "malformedToken", grantType: "refresh_token" })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error.message).to.contain("INVALID_REFRESH_TOKEN");
+      });
+  });
+
   it("should error if user is disabled", async () => {
     const { refreshToken, localId } = await registerAnonUser(authApi());
     await updateAccountByLocalId(authApi(), localId, { disableUser: true });
@@ -84,6 +180,47 @@ describeAuthEmulator("token refresh", ({ authApi, getClock }) => {
       .then((res) => {
         expectStatusCode(400, res);
         expect(res.body.error.message).to.equal("USER_DISABLED");
+      });
+  });
+
+  it("should error when refresh tokens are from a different project", async () => {
+    const refreshTokenRecord = {
+      _AuthEmulatorRefreshToken: "DO NOT MODIFY",
+      localId: "localId",
+      provider: "provider",
+      extraClaims: {},
+      projectId: "notMatchingProjectId",
+    };
+    const refreshToken = encodeRefreshToken(refreshTokenRecord);
+
+    await authApi()
+      .post("/securetoken.googleapis.com/v1/token")
+      .type("form")
+      .send({ refresh_token: refreshToken, grantType: "refresh_token" })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error).to.have.property("message").equals("INVALID_REFRESH_TOKEN");
+      });
+  });
+
+  it("should error on refresh tokens without required fields", async () => {
+    const refreshTokenRecord = {
+      localId: "localId",
+      provider: "provider",
+      extraClaims: {},
+      projectId: "notMatchingProjectId",
+    };
+    const refreshToken = encodeRefreshToken(refreshTokenRecord as RefreshTokenRecord);
+
+    await authApi()
+      .post("/securetoken.googleapis.com/v1/token")
+      .type("form")
+      .send({ refresh_token: refreshToken, grantType: "refresh_token" })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error).to.have.property("message").equals("INVALID_REFRESH_TOKEN");
       });
   });
 });
@@ -250,6 +387,41 @@ describeAuthEmulator("accounts:lookup", ({ authApi }) => {
         expect(res.body).not.to.have.property("users");
       });
   });
+
+  it("should return user by tenantId in idToken", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, {
+      disableAuth: false,
+      allowPasswordSignup: true,
+    });
+    const { idToken, localId } = await registerUser(authApi(), {
+      email: "alice@example.com",
+      password: "notasecret",
+      tenantId: tenant.tenantId,
+    });
+
+    await authApi()
+      .post(`/identitytoolkit.googleapis.com/v1/accounts:lookup`)
+      .send({ idToken })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(200, res);
+        expect(res.body.users).to.have.length(1);
+        expect(res.body.users[0].localId).to.equal(localId);
+      });
+  });
+
+  it("should error if auth is disabled", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, { disableAuth: true });
+
+    await authApi()
+      .post("/identitytoolkit.googleapis.com/v1/accounts:lookup")
+      .set("Authorization", "Bearer owner")
+      .send({ tenantId: tenant.tenantId })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error).to.have.property("message").includes("PROJECT_DISABLED");
+      });
+  });
 });
 
 describeAuthEmulator("accounts:query", ({ authApi }) => {
@@ -294,6 +466,19 @@ describeAuthEmulator("accounts:query", ({ authApi }) => {
         expect(emailUser!.email).to.equal(user.email);
       });
   });
+
+  it("should error if auth is disabled", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, { disableAuth: true });
+
+    await authApi()
+      .post(`/identitytoolkit.googleapis.com/v1/projects/${PROJECT_ID}/accounts:query`)
+      .set("Authorization", "Bearer owner")
+      .send({ tenantId: tenant.tenantId })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error).to.have.property("message").equals("PROJECT_DISABLED");
+      });
+  });
 });
 
 describeAuthEmulator("emulator utility APIs", ({ authApi }) => {
@@ -315,30 +500,61 @@ describeAuthEmulator("emulator utility APIs", ({ authApi }) => {
     await expectUserNotExistsForIdToken(authApi(), user2.idToken);
   });
 
+  it("should drop all accounts on DELETE /emulator/v1/projects/{PROJECT_ID}/tenants/{TENANT_ID}/accounts", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, {
+      disableAuth: false,
+      allowPasswordSignup: true,
+    });
+    const user1 = await registerUser(authApi(), {
+      email: "alice@example.com",
+      password: "notasecret",
+      tenantId: tenant.tenantId,
+    });
+    const user2 = await registerUser(authApi(), {
+      email: "bob@example.com",
+      password: "notasecret2",
+      tenantId: tenant.tenantId,
+    });
+
+    await authApi()
+      .delete(`/emulator/v1/projects/${PROJECT_ID}/tenants/${tenant.tenantId}/accounts`)
+      .send()
+      .then((res) => expectStatusCode(200, res));
+
+    await expectUserNotExistsForIdToken(authApi(), user1.idToken, tenant.tenantId);
+    await expectUserNotExistsForIdToken(authApi(), user2.idToken, tenant.tenantId);
+  });
+
   it("should return config on GET /emulator/v1/projects/{PROJECT_ID}/config", async () => {
     await authApi()
       .get(`/emulator/v1/projects/${PROJECT_ID}/config`)
       .send()
       .then((res) => {
         expectStatusCode(200, res);
-        expect(res.body)
-          .to.have.property("signIn")
-          .eql({ allowDuplicateEmails: false /* default value */ });
+        expect(res.body).to.have.property("signIn").eql({
+          allowDuplicateEmails: false /* default value */,
+        });
       });
   });
-  it("should update config on PATCH /emulator/v1/projects/{PROJECT_ID}/config", async () => {
+
+  it("should update allowDuplicateEmails on PATCH /emulator/v1/projects/{PROJECT_ID}/config", async () => {
     await authApi()
       .patch(`/emulator/v1/projects/${PROJECT_ID}/config`)
       .send({ signIn: { allowDuplicateEmails: true } })
       .then((res) => {
-        expect(res.body).to.have.property("signIn").eql({ allowDuplicateEmails: true });
+        expectStatusCode(200, res);
+        expect(res.body).to.have.property("signIn").eql({
+          allowDuplicateEmails: true,
+        });
       });
     await authApi()
       .patch(`/emulator/v1/projects/${PROJECT_ID}/config`)
       .send({ signIn: { allowDuplicateEmails: false } })
       .then((res) => {
         expectStatusCode(200, res);
-        expect(res.body).to.have.property("signIn").eql({ allowDuplicateEmails: false });
+        expect(res.body).to.have.property("signIn").eql({
+          allowDuplicateEmails: false,
+        });
       });
   });
 });

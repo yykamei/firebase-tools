@@ -2,7 +2,7 @@ import { Suite } from "mocha";
 import { useFakeTimers } from "sinon";
 import supertest = require("supertest");
 import { createApp } from "../../../emulator/auth/server";
-import { ProjectState } from "../../../emulator/auth/state";
+import { AgentProjectState } from "../../../emulator/auth/state";
 
 export const PROJECT_ID = "example";
 
@@ -19,7 +19,7 @@ export function describeAuthEmulator(
   return describe(`Auth Emulator: ${title}`, function (this) {
     let authApp: Express.Application;
     beforeEach("setup or reuse auth server", async function (this) {
-      this.timeout(10000);
+      this.timeout(20000);
       authApp = await createOrReuseApp();
     });
 
@@ -41,7 +41,7 @@ export type AuthTestUtils = {
 
 // Keep a global auth server since start-up takes too long:
 let cachedAuthApp: Express.Application;
-const projectStateForId = new Map<string, ProjectState>();
+const projectStateForId = new Map<string, AgentProjectState>();
 
 async function createOrReuseApp(): Promise<Express.Application> {
   if (!cachedAuthApp) {

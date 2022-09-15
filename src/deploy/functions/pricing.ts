@@ -117,34 +117,38 @@ export const V2_FREE_TIER = {
 
 // In v1, CPU is automatically fixed to the memory size determines the CPU size.
 // Table at https://cloud.google.com/functions/pricing#compute_time
+const VCPU_TO_GHZ = 2.4;
 const MB_TO_GHZ = {
   128: 0.2,
   256: 0.4,
   512: 0.8,
   1024: 1.4,
-  2048: 2.4,
-  4096: 4.8,
-  8192: 4.8,
+  2048: 1 * VCPU_TO_GHZ,
+  4096: 2 * VCPU_TO_GHZ,
+  8192: 2 * VCPU_TO_GHZ,
+  16384: 4 * VCPU_TO_GHZ,
+  32768: 8 * VCPU_TO_GHZ,
 };
 
-export function canCalculateMinInstanceCost(functionSpec: backend.FunctionSpec): boolean {
-  if (!functionSpec.minInstances) {
+/** Whether we have information in our price sheet to calculate the minInstance cost. */
+export function canCalculateMinInstanceCost(endpoint: backend.Endpoint): boolean {
+  if (!endpoint.minInstances) {
     return true;
   }
 
-  if (functionSpec.platform == "gcfv1") {
-    if (!MB_TO_GHZ[functionSpec.availableMemoryMb || 256]) {
+  if (endpoint.platform === "gcfv1") {
+    if (!MB_TO_GHZ[endpoint.availableMemoryMb || backend.DEFAULT_MEMORY]) {
       return false;
     }
 
-    if (!V1_REGION_TO_TIER[functionSpec.region]) {
+    if (!V1_REGION_TO_TIER[endpoint.region]) {
       return false;
     }
 
     return true;
   }
 
-  if (!V2_REGION_TO_TIER[functionSpec.region]) {
+  if (!V2_REGION_TO_TIER[endpoint.region]) {
     return false;
   }
 
@@ -154,7 +158,9 @@ export function canCalculateMinInstanceCost(functionSpec: backend.FunctionSpec):
 // A hypothetical month has 30d. ALWAYS PRINT THIS ASSUMPTION when printing
 // a cost estimate.
 const SECONDS_PER_MONTH = 30 * 24 * 60 * 60;
-export function monthlyMinInstanceCost(functions: backend.FunctionSpec[]): number {
+
+/** The cost of a series of endpoints at 100% idle in a 30d month. */
+export function monthlyMinInstanceCost(endpoints: backend.Endpoint[]): number {
   // Assertion: canCalculateMinInstanceCost
   type Usage = {
     ram: number;
@@ -165,28 +171,28 @@ export function monthlyMinInstanceCost(functions: backend.FunctionSpec[]): numbe
     gcfv2: { 1: { ram: 0, cpu: 0 }, 2: { ram: 0, cpu: 0 } },
   };
 
-  for (const func of functions) {
-    if (!func.minInstances) {
+  for (const endpoint of endpoints) {
+    if (!endpoint.minInstances) {
       continue;
     }
 
-    const ramMb = func.availableMemoryMb || 256;
+    const ramMb = endpoint.availableMemoryMb || backend.DEFAULT_MEMORY;
     const ramGb = ramMb / 1024;
-    if (func.platform === "gcfv1") {
+    if (endpoint.platform === "gcfv1") {
       const cpu = MB_TO_GHZ[ramMb];
-      const tier = V1_REGION_TO_TIER[func.region];
+      const tier = V1_REGION_TO_TIER[endpoint.region];
       usage["gcfv1"][tier].ram =
-        usage["gcfv1"][tier].ram + ramGb * SECONDS_PER_MONTH * func.minInstances;
+        usage["gcfv1"][tier].ram + ramGb * SECONDS_PER_MONTH * endpoint.minInstances;
       usage["gcfv1"][tier].cpu =
-        usage["gcfv1"][tier].cpu + MB_TO_GHZ[ramMb] * SECONDS_PER_MONTH * func.minInstances;
+        usage["gcfv1"][tier].cpu + cpu * SECONDS_PER_MONTH * endpoint.minInstances;
     } else {
       // V2 is currently fixed at 1vCPU.
-      const cpu = 1;
-      const tier = V2_REGION_TO_TIER[func.region];
+      const tier = V2_REGION_TO_TIER[endpoint.region];
       usage["gcfv2"][tier].ram =
-        usage["gcfv2"][tier].ram + ramGb * SECONDS_PER_MONTH * func.minInstances;
+        usage["gcfv2"][tier].ram + ramGb * SECONDS_PER_MONTH * endpoint.minInstances;
       usage["gcfv2"][tier].cpu =
-        usage["gcfv2"][tier].cpu + cpu * SECONDS_PER_MONTH * func.minInstances;
+        usage["gcfv2"][tier].cpu +
+        (endpoint.cpu as number) * SECONDS_PER_MONTH * endpoint.minInstances;
     }
   }
 

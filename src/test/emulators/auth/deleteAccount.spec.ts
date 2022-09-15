@@ -1,11 +1,12 @@
 import { expect } from "chai";
-import { describeAuthEmulator } from "./setup";
+import { describeAuthEmulator, PROJECT_ID } from "./setup";
 import {
   expectStatusCode,
   registerUser,
   signInWithFakeClaims,
   getSigninMethods,
   expectUserNotExistsForIdToken,
+  registerTenant,
 } from "./helpers";
 
 describeAuthEmulator("accounts:delete", ({ authApi }) => {
@@ -101,6 +102,19 @@ describeAuthEmulator("accounts:delete", ({ authApi }) => {
       .then((res) => {
         expectStatusCode(400, res);
         expect(res.body.error).to.have.property("message").equals("MISSING_LOCAL_ID");
+      });
+  });
+
+  it("should delete the user of the idToken", async () => {
+    const tenant = await registerTenant(authApi(), PROJECT_ID, { disableAuth: true });
+
+    await authApi()
+      .post("/identitytoolkit.googleapis.com/v1/accounts:delete")
+      .send({ tenantId: tenant.tenantId })
+      .query({ key: "fake-api-key" })
+      .then((res) => {
+        expectStatusCode(400, res);
+        expect(res.body.error).to.have.property("message").includes("PROJECT_DISABLED");
       });
   });
 });

@@ -1,12 +1,13 @@
-import * as clc from "cli-color";
+import * as clc from "colorette";
 import * as semver from "semver";
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-var-requires
+const { marked } = require("marked");
 
 import { FirebaseError } from "../error";
 import { logger } from "../logger";
-import * as resolveSource from "./resolveSource";
 import * as extensionsApi from "./extensionsApi";
-import { promptOnce } from "../prompt";
-import * as marked from "marked";
+import { ExtensionSource, ExtensionSpec } from "./types";
+import * as refs from "./refs";
 import {
   createSourceFromLocation,
   logPrefix,
@@ -14,12 +15,7 @@ import {
   isLocalOrURLPath,
 } from "./extensionsHelper";
 import * as utils from "../utils";
-import {
-  displayUpdateChangesNoInput,
-  displayUpdateChangesRequiringConfirmation,
-  getConsent,
-  displayExtInfo,
-} from "./displayExtensionInfo";
+import { displayExtInfo } from "./displayExtensionInfo";
 import * as changelog from "./changelog";
 
 function invalidSourceErrMsgTemplate(instanceId: string, source: string): string {
@@ -34,9 +30,7 @@ function invalidSourceErrMsgTemplate(instanceId: string, source: string): string
 
 export async function getExistingSourceOrigin(
   projectId: string,
-  instanceId: string,
-  extensionName: string,
-  existingSource: string
+  instanceId: string
 ): Promise<SourceOrigin> {
   const instance = await extensionsApi.getInstance(projectId, instanceId);
   return instance && instance.config.extensionRef
@@ -44,12 +38,12 @@ export async function getExistingSourceOrigin(
     : SourceOrigin.LOCAL;
 }
 
-async function showUpdateVersionInfo(
+function showUpdateVersionInfo(
   instanceId: string,
   from: string,
   to: string,
   source?: string
-): Promise<void> {
+): void {
   if (source) {
     source = clc.bold(source);
   } else {
@@ -60,11 +54,10 @@ async function showUpdateVersionInfo(
     `Updating ${clc.bold(instanceId)} from version ${clc.bold(from)} to ${source} (${clc.bold(to)})`
   );
   if (semver.lt(to, from)) {
-    utils.logLabeledBullet(
+    utils.logLabeledWarning(
       logPrefix,
       "The version you are updating to is less than the current version for this extension. This extension may not be backwards compatible."
     );
-    return await getConsent("version", "Do you wish to continue?");
   }
   return;
 }
@@ -91,38 +84,6 @@ export function warningUpdateToOtherSource(sourceOrigin: SourceOrigin) {
 }
 
 /**
- * Displays all differences between spec and newSpec.
- * First, displays all changes that do not require explicit confirmation,
- * then prompts the user for each change that requires confirmation.
- *
- * @param spec A current extensionSpec
- * @param newSpec A extensionSpec to compare to
- * @param published
- */
-export async function displayChanges(
-  spec: extensionsApi.ExtensionSpec,
-  newSpec: extensionsApi.ExtensionSpec
-): Promise<void> {
-  logger.info(
-    "This update contains the following changes (in green and red). " +
-      "If at any point you choose not to continue, the extension will not be updated and the changes will be discarded:\n"
-  );
-  displayUpdateChangesNoInput(spec, newSpec);
-  await displayUpdateChangesRequiringConfirmation(spec, newSpec);
-}
-
-/**
- * Prompts the user to confirm before continuing to update.
- */
-export async function retryUpdate(): Promise<boolean> {
-  return promptOnce({
-    type: "confirm",
-    message: "Are you sure you wish to continue with updating anyways?",
-    default: false,
-  });
-}
-
-/**
  * @param projectId Id of the project containing the instance to update
  * @param instanceId Id of the instance to update
  * @param extRef Extension reference
@@ -133,9 +94,12 @@ export async function retryUpdate(): Promise<boolean> {
 export interface UpdateOptions {
   projectId: string;
   instanceId: string;
-  source?: extensionsApi.ExtensionSource;
+  source?: ExtensionSource;
   extRef?: string;
   params?: { [key: string]: string };
+  canEmitEvents: boolean;
+  allowedEventTypes?: string[];
+  eventarcChannel?: string;
 }
 
 /**
@@ -147,11 +111,36 @@ export interface UpdateOptions {
  * @param updateOptions Info on the instance and associated resources to update
  */
 export async function update(updateOptions: UpdateOptions): Promise<any> {
-  const { projectId, instanceId, source, extRef, params } = updateOptions;
+  const {
+    projectId,
+    instanceId,
+    source,
+    extRef,
+    params,
+    canEmitEvents,
+    allowedEventTypes,
+    eventarcChannel,
+  } = updateOptions;
   if (extRef) {
-    return await extensionsApi.updateInstanceFromRegistry(projectId, instanceId, extRef, params);
+    return await extensionsApi.updateInstanceFromRegistry({
+      projectId,
+      instanceId,
+      extRef,
+      params,
+      canEmitEvents,
+      allowedEventTypes,
+      eventarcChannel,
+    });
   } else if (source) {
-    return await extensionsApi.updateInstance(projectId, instanceId, source, params);
+    return await extensionsApi.updateInstance({
+      projectId,
+      instanceId,
+      extensionSource: source,
+      params,
+      canEmitEvents,
+      allowedEventTypes,
+      eventarcChannel,
+    });
   }
   throw new FirebaseError(
     `Neither a source nor a version of the extension was supplied for ${instanceId}. Please make sure this is a valid extension and try again.`
@@ -164,29 +153,26 @@ export async function update(updateOptions: UpdateOptions): Promise<any> {
  * @param instanceId Id of the instance to update
  * @param localSource path to the new local source
  * @param existingSpec ExtensionSpec of existing instance source
- * @param existingSource name of existing instance source
  */
 export async function updateFromLocalSource(
   projectId: string,
   instanceId: string,
   localSource: string,
-  existingSpec: extensionsApi.ExtensionSpec,
-  existingSource: string
+  existingSpec: ExtensionSpec
 ): Promise<string> {
   displayExtInfo(instanceId, "", existingSpec, false);
   let source;
   try {
     source = await createSourceFromLocation(projectId, localSource);
-  } catch (err) {
+  } catch (err: any) {
     throw new FirebaseError(invalidSourceErrMsgTemplate(instanceId, localSource));
   }
   utils.logLabeledBullet(
     logPrefix,
     `${clc.bold("You are updating this extension instance to a local source.")}`
   );
-  await showUpdateVersionInfo(instanceId, existingSpec.version, source.spec.version, localSource);
+  showUpdateVersionInfo(instanceId, existingSpec.version, source.spec.version, localSource);
   warningUpdateToOtherSource(SourceOrigin.LOCAL);
-  await confirmUpdate();
   return source.name;
 }
 
@@ -202,23 +188,21 @@ export async function updateFromUrlSource(
   projectId: string,
   instanceId: string,
   urlSource: string,
-  existingSpec: extensionsApi.ExtensionSpec,
-  existingSource: string
+  existingSpec: ExtensionSpec
 ): Promise<string> {
   displayExtInfo(instanceId, "", existingSpec, false);
   let source;
   try {
     source = await createSourceFromLocation(projectId, urlSource);
-  } catch (err) {
+  } catch (err: any) {
     throw new FirebaseError(invalidSourceErrMsgTemplate(instanceId, urlSource));
   }
   utils.logLabeledBullet(
     logPrefix,
     `${clc.bold("You are updating this extension instance to a URL source.")}`
   );
-  await showUpdateVersionInfo(instanceId, existingSpec.version, source.spec.version, urlSource);
+  showUpdateVersionInfo(instanceId, existingSpec.version, source.spec.version, urlSource);
   warningUpdateToOtherSource(SourceOrigin.URL);
-  await confirmUpdate();
   return source.name;
 }
 
@@ -232,45 +216,27 @@ export async function updateToVersionFromPublisherSource(
   projectId: string,
   instanceId: string,
   extVersionRef: string,
-  existingSpec: extensionsApi.ExtensionSpec,
-  existingSource: string
+  existingSpec: ExtensionSpec
 ): Promise<string> {
   let source;
-  const refObj = extensionsApi.parseRef(extVersionRef);
-  const version = refObj.version;
-  const extensionRef = `${refObj.publisherId}/${refObj.extensionId}`;
-  displayExtInfo(instanceId, refObj.publisherId, existingSpec, true);
+  const ref = refs.parse(extVersionRef);
+  const version = ref.version;
+  const extensionRef = refs.toExtensionRef(ref);
+  displayExtInfo(instanceId, ref.publisherId, existingSpec, true);
   const extension = await extensionsApi.getExtension(extensionRef);
   try {
     source = await extensionsApi.getExtensionVersion(extVersionRef);
-  } catch (err) {
+  } catch (err: any) {
     throw new FirebaseError(
       `Could not find source '${clc.bold(extVersionRef)}' because (${clc.bold(
-        version
+        version || ""
       )}) is not a published version. To update, use the latest version of this extension (${clc.bold(
-        extension.latestVersion
+        extension.latestVersion || ""
       )}).`
     );
   }
-  let registryEntry;
-  try {
-    registryEntry = await resolveSource.resolveRegistryEntry(existingSpec.name);
-  } catch (err) {
-    logger.debug(`Unable to fetch registry.json entry for ${existingSpec.name}`);
-  }
 
-  if (registryEntry) {
-    // Do not allow user to "downgrade" to a version lower than the minimum required version.
-    const minVer = resolveSource.getMinRequiredVersion(registryEntry);
-    if (minVer && semver.gt(minVer, source.spec.version)) {
-      throw new FirebaseError(
-        `The version you are trying to update to (${clc.bold(
-          source.spec.version
-        )}) is less than the minimum version required (${clc.bold(minVer)}) to use this extension.`
-      );
-    }
-  }
-  await showUpdateVersionInfo(instanceId, existingSpec.version, source.spec.version, extVersionRef);
+  showUpdateVersionInfo(instanceId, existingSpec.version, source.spec.version, extVersionRef);
   warningUpdateToOtherSource(SourceOrigin.PUBLISHED_EXTENSION);
   const releaseNotes = await changelog.getReleaseNotesForUpdate({
     extensionRef,
@@ -280,7 +246,6 @@ export async function updateToVersionFromPublisherSource(
   if (Object.keys(releaseNotes).length) {
     changelog.displayReleaseNotes(releaseNotes, existingSpec.version);
   }
-  await confirmUpdate();
   return source.name;
 }
 
@@ -294,15 +259,13 @@ export async function updateFromPublisherSource(
   projectId: string,
   instanceId: string,
   extRef: string,
-  existingSpec: extensionsApi.ExtensionSpec,
-  existingSource: string
+  existingSpec: ExtensionSpec
 ): Promise<string> {
   return updateToVersionFromPublisherSource(
     projectId,
     instanceId,
     `${extRef}@latest`,
-    existingSpec,
-    existingSource
+    existingSpec
   );
 }
 
@@ -322,15 +285,4 @@ export function inferUpdateSource(updateSource: string, existingRef: string): st
     return `${updateSource}@latest`;
   }
   return updateSource;
-}
-
-export async function confirmUpdate() {
-  const continueUpdate = await promptOnce({
-    type: "confirm",
-    message: "Do you wish to continue with this update?",
-    default: false,
-  });
-  if (!continueUpdate) {
-    throw new FirebaseError(`Update cancelled.`);
-  }
 }

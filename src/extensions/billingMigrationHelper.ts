@@ -1,8 +1,9 @@
-import * as marked from "marked";
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-var-requires
+const { marked } = require("marked");
 import TerminalRenderer = require("marked-terminal");
 
 import { FirebaseError } from "../error";
-import * as extensionsApi from "./extensionsApi";
+import { ExtensionSpec } from "./types";
 import { logPrefix } from "./extensionsHelper";
 import { promptOnce } from "../prompt";
 import * as utils from "../utils";
@@ -36,7 +37,7 @@ const defaultRuntimes: { [key: string]: string } = {
   v1beta: "nodejs8",
 };
 
-function hasRuntime(spec: extensionsApi.ExtensionSpec, runtime: string): boolean {
+function hasRuntime(spec: ExtensionSpec, runtime: string): boolean {
   const specVersion = spec.specVersion || defaultSpecVersion;
   const defaultRuntime = defaultRuntimes[specVersion];
   const resources = spec.resources || [];
@@ -48,26 +49,13 @@ function hasRuntime(spec: extensionsApi.ExtensionSpec, runtime: string): boolean
  *
  * @param curSpec A current extensionSpec
  * @param newSpec A extensionSpec to compare to
- * @param prompt If true, prompts user for confirmation
  */
-export async function displayNode10UpdateBillingNotice(
-  curSpec: extensionsApi.ExtensionSpec,
-  newSpec: extensionsApi.ExtensionSpec,
-  prompt: boolean
-): Promise<void> {
+export function displayNode10UpdateBillingNotice(
+  curSpec: ExtensionSpec,
+  newSpec: ExtensionSpec
+): void {
   if (hasRuntime(curSpec, "nodejs8") && hasRuntime(newSpec, "nodejs10")) {
     utils.logLabeledWarning(logPrefix, marked(billingMsgUpdate));
-
-    if (prompt) {
-      const continueUpdate = await promptOnce({
-        type: "confirm",
-        message: "Do you wish to continue?",
-        default: true,
-      });
-      if (!continueUpdate) {
-        throw new FirebaseError(`Cancelled.`, { exit: 2 });
-      }
-    }
   }
 }
 
@@ -78,7 +66,7 @@ export async function displayNode10UpdateBillingNotice(
  * @param prompt If true, prompts user for confirmation
  */
 export async function displayNode10CreateBillingNotice(
-  spec: extensionsApi.ExtensionSpec,
+  spec: ExtensionSpec,
   prompt: boolean
 ): Promise<void> {
   if (hasRuntime(spec, "nodejs10")) {

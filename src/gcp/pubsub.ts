@@ -1,6 +1,5 @@
 import { Client } from "../apiv2";
 import { pubsubOrigin } from "../api";
-import * as backend from "../deploy/functions/backend";
 import * as proto from "./proto";
 
 const API_VERSION = "v1";
@@ -51,13 +50,6 @@ export async function updateTopic(topic: Topic): Promise<Topic> {
 
 export async function deleteTopic(name: string): Promise<void> {
   await client.delete(name);
-}
-
-export function topicFromSpec(spec: backend.PubSubSpec): Topic {
-  return {
-    name: backend.topicName(spec),
-    labels: { ...spec.labels },
-  };
 }
 
 // NOTE: We currently don't need or have specFromTopic.
