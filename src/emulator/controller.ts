@@ -825,7 +825,7 @@ export async function startAll(
 
   if (listenForEmulator.remoteconfig) {
     const rcAddr = legacyGetFirstAddr(Emulators.REMOTE_CONFIG);
-    const rcConfig = options.config.data.remoteconfig;
+    const rcConfig = options.config?.data?.remoteconfig;
 
     if (!rcConfig?.template) {
       throw new FirebaseError(
